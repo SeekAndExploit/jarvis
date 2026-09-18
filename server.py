@@ -3862,7 +3862,7 @@ async def tool_steer_session(args: dict) -> str:
 # place" speaks it and a path legitimately holds almost any punctuation. The
 # residual is prose in a header line, for the price of two same-named
 # directories; it is accepted, and it is not parity with the name wall.
-_PLAIN_PATH_RE = _action_re.compile(r"/[^\x00-\x1f\x7f-\x9f<>\"=\u2028\u2029]{0,299}")
+_PLAIN_PATH_RE = _action_re.compile(r"(?:[A-Za-z]:)?[/\\][^\x00-\x1f\x7f-\x9f<>\"=\u2028\u2029]{0,299}")
 
 
 def _project_name_speakable(name) -> bool:

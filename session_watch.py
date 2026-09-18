@@ -50,10 +50,37 @@ def pid_alive(pid) -> bool:
         pid = int(pid)
         if pid <= 0:
             return False
+        if os.name == "nt":
+            # Windows patch: os.kill(pid, 0) on Windows is TerminateProcess,
+            # i.e. it KILLS the process. Ask the kernel instead.
+            return _win_pid_alive(pid)
         os.kill(pid, 0)
     except (OSError, TypeError, ValueError):
         return False
     return True
+
+
+def _win_pid_alive(pid: int) -> bool:
+    import ctypes
+    from ctypes import wintypes
+    PROCESS_QUERY_LIMITED_INFORMATION = 0x1000
+    STILL_ACTIVE = 259
+    k32 = ctypes.WinDLL("kernel32", use_last_error=True)
+    k32.OpenProcess.restype = wintypes.HANDLE
+    k32.OpenProcess.argtypes = [wintypes.DWORD, wintypes.BOOL, wintypes.DWORD]
+    k32.GetExitCodeProcess.argtypes = [wintypes.HANDLE, ctypes.POINTER(wintypes.DWORD)]
+    k32.CloseHandle.argtypes = [wintypes.HANDLE]
+    h = k32.OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, False, pid)
+    if not h:
+        # Access denied still means it exists; anything else means gone.
+        return ctypes.get_last_error() == 5
+    try:
+        code = wintypes.DWORD()
+        if not k32.GetExitCodeProcess(h, ctypes.byref(code)):
+            return True
+        return code.value == STILL_ACTIVE
+    finally:
+        k32.CloseHandle(h)
 
 
 def encode_cwd(cwd: str) -> str:
