@@ -6,7 +6,9 @@ returned whole because the browser decodes one complete MP3 per chunk.
 """
 from __future__ import annotations
 
+import asyncio
 import logging
+import os
 import time
 from dataclasses import dataclass
 from typing import Optional
@@ -29,8 +31,49 @@ async def synthesize_chunk(text: str, *, api_key: str, voice_id: str,
                            client: Optional[httpx.AsyncClient] = None,
                            latency: str = "balanced", timeout: float = 15.0) -> Optional[SynthResult]:
     text = (text or "").strip()
-    if not text or not api_key:
+    if not text:
         return None
+    engine = os.getenv("TTS_ENGINE", "auto").lower()   # auto | fish | edge
+    if engine != "edge" and api_key:
+        r = await _fish_chunk(text, api_key=api_key, voice_id=voice_id,
+                              client=client, latency=latency, timeout=timeout)
+        if r is not None or engine == "fish":
+            return r
+    return await _edge_chunk(text, timeout=timeout)
+
+
+async def _edge_chunk(text: str, *, timeout: float = 15.0) -> Optional[SynthResult]:
+    """Free fallback voice: Microsoft Edge neural TTS (pip install edge-tts).
+    Voice set by EDGE_VOICE, default en-GB-RyanNeural (British male)."""
+    try:
+        import edge_tts
+    except ImportError:
+        log.error("edge-tts not installed; run: pip install edge-tts")
+        return None
+    voice = os.getenv("EDGE_VOICE", "en-GB-RyanNeural")
+    t0 = time.monotonic()
+    first: Optional[float] = None
+    buf = bytearray()
+    try:
+        async def run():
+            nonlocal first
+            async for part in edge_tts.Communicate(text, voice).stream():
+                if part.get("type") == "audio":
+                    if first is None:
+                        first = time.monotonic() - t0
+                    buf.extend(part["data"])
+        await asyncio.wait_for(run(), timeout=timeout)
+    except Exception as e:
+        log.error(f"edge TTS error: {e}")
+        return None
+    if not buf:
+        return None
+    return SynthResult(bytes(buf), first or 0.0, time.monotonic() - t0)
+
+
+async def _fish_chunk(text: str, *, api_key: str, voice_id: str,
+                      client: Optional[httpx.AsyncClient] = None,
+                      latency: str = "balanced", timeout: float = 15.0) -> Optional[SynthResult]:
     own = client is None
     client = client or httpx.AsyncClient(timeout=timeout)
     t0 = time.monotonic()
