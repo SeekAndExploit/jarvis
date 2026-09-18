@@ -792,11 +792,23 @@ def _forward(tool: str, arguments: dict) -> tuple[bool, str, dict | None]:
         headers={"Content-Type": "application/json",
                  "Authorization": f"Bearer {_token()}"})
     try:
-        with urllib.request.urlopen(
-                req, timeout=TIMEOUT_SEC, context=_ssl_context_for(endpoint)) as resp:
+        # Windows patch: never send loopback calls through a system proxy
+        # (Windows' registry proxy is picked up by urllib and 127.0.0.1 is
+        # usually not in its bypass list, so every call came back refused).
+        handlers: list = [urllib.request.ProxyHandler({})]
+        ctx = _ssl_context_for(endpoint)
+        if ctx is not None:
+            handlers.append(urllib.request.HTTPSHandler(context=ctx))
+        opener = urllib.request.build_opener(*handlers)
+        with opener.open(req, timeout=TIMEOUT_SEC) as resp:
             payload = json.loads(resp.read().decode("utf-8", errors="replace"))
     except urllib.error.HTTPError as e:
-        return False, f"JARVIS refused the call ({e.code}).", None
+        detail = ""
+        try:
+            detail = e.read().decode("utf-8", "replace")[:200]
+        except Exception:
+            pass
+        return False, f"JARVIS refused the call ({e.code}) {detail}".strip(), None
     except (urllib.error.URLError, OSError, TimeoutError):
         return False, "The JARVIS server is unreachable.", None
     except ValueError:
