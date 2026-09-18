@@ -376,7 +376,7 @@ def ensure_tool_token() -> str:
 
     token = secrets.token_urlsafe(32)
     try:
-        fd = os.open(str(path), os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o600)
+        fd = os.open(str(path), os.O_CREAT | os.O_EXCL | os.O_WRONLY | getattr(os, "O_BINARY", 0), 0o600)
     except FileExistsError:
         pass
     else:
@@ -386,14 +386,16 @@ def ensure_tool_token() -> str:
             os.close(fd)
         return token
 
-    fd = os.open(str(path), os.O_RDWR | os.O_NOFOLLOW)
+    # Windows patch: O_NOFOLLOW, getuid and fchmod are POSIX-only.
+    fd = os.open(str(path), os.O_RDWR | getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_BINARY", 0))
     try:
         info = os.fstat(fd)
         if not _stat.S_ISREG(info.st_mode):
             raise OSError(f"{path} is not a regular file")
-        if info.st_uid != os.getuid():
+        if hasattr(os, "getuid") and info.st_uid != os.getuid():
             raise OSError(f"{path} is owned by uid {info.st_uid}, not by us")
-        os.fchmod(fd, 0o600)
+        if hasattr(os, "fchmod") and os.name != "nt":
+            os.fchmod(fd, 0o600)
         existing = os.read(fd, 4096).decode("utf-8", "ignore").strip()
         if existing:
             return existing

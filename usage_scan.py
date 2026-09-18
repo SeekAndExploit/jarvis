@@ -158,8 +158,14 @@ def _tokens_from(usage) -> Tokens:
 # `fromisoformat` accepts that string happily, so catching only its ValueError
 # left the second call unguarded. Two years of slack at each end covers every
 # UTC offset without needing to know the local one.
-_DAY_MIN = datetime(2, 1, 1).timestamp()
-_DAY_MAX = datetime(9997, 1, 1).timestamp()
+if os.name == "nt":
+    # Windows patch: its C runtime can't convert local times before 1970 or
+    # after year 3000, so keep the same two days of slack inside that range.
+    _DAY_MIN = 172800.0          # 1970-01-03 UTC
+    _DAY_MAX = 32472144000.0     # 2999-01-01 UTC
+else:
+    _DAY_MIN = datetime(2, 1, 1).timestamp()
+    _DAY_MAX = datetime(9997, 1, 1).timestamp()
 
 
 def _epoch(stamp) -> float | None:
