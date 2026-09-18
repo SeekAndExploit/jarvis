@@ -407,3 +407,92 @@ async def list_windows() -> list[Window]:
         if len(windows) >= MAX_WINDOWS:
             break
     return windows
+
+
+# ── Windows patch ──────────────────────────────────────────────────────────
+# On Windows, `screencapture`/`sips`/`osascript` don't exist. The same two
+# capabilities are done with PowerShell + .NET (built into Windows), keeping
+# the same rules: one capture per user-driven turn, temp dir removed after.
+
+_WIN_CAPTURE_PS = r"""
+param([string]$Out, [int]$Display, [int]$MaxEdge)
+Add-Type -AssemblyName System.Windows.Forms, System.Drawing
+Add-Type -Namespace J -Name Dpi -MemberDefinition '[DllImport("user32.dll")] public static extern bool SetProcessDPIAware();'
+[void][J.Dpi]::SetProcessDPIAware()
+$screens = [System.Windows.Forms.Screen]::AllScreens
+if ($Display -ge 1 -and $Display -le $screens.Length) { $s = $screens[$Display-1] } else { $s = [System.Windows.Forms.Screen]::PrimaryScreen }
+$b = $s.Bounds
+$bmp = New-Object System.Drawing.Bitmap $b.Width, $b.Height
+$g = [System.Drawing.Graphics]::FromImage($bmp)
+$g.CopyFromScreen($b.Location, [System.Drawing.Point]::Empty, $b.Size)
+$scale = [Math]::Min(1.0, $MaxEdge / [double][Math]::Max($b.Width, $b.Height))
+$w = [int]($b.Width * $scale); $h = [int]($b.Height * $scale)
+$small = New-Object System.Drawing.Bitmap $w, $h
+$g2 = [System.Drawing.Graphics]::FromImage($small)
+$g2.InterpolationMode = [System.Drawing.Drawing2D.InterpolationMode]::HighQualityBicubic
+$g2.DrawImage($bmp, 0, 0, $w, $h)
+$small.Save($Out, [System.Drawing.Imaging.ImageFormat]::Png)
+$g.Dispose(); $g2.Dispose(); $bmp.Dispose(); $small.Dispose()
+"""
+
+_WIN_WINDOWS_PS = r"""
+Add-Type -Namespace J -Name Fg -MemberDefinition '[DllImport("user32.dll")] public static extern System.IntPtr GetForegroundWindow(); [DllImport("user32.dll")] public static extern uint GetWindowThreadProcessId(System.IntPtr h, out uint p);'
+$fp = 0; [void][J.Fg]::GetWindowThreadProcessId([J.Fg]::GetForegroundWindow(), [ref]$fp)
+Get-Process | Where-Object { $_.MainWindowTitle } | ForEach-Object {
+  $n = $_.ProcessName; try { if ($_.MainModule.FileVersionInfo.FileDescription) { $n = $_.MainModule.FileVersionInfo.FileDescription } } catch {}
+  "$n|||$($_.MainWindowTitle)|||$($_.Id -eq $fp)"
+}
+"""
+
+
+async def _win_ps(script: str, *args: str, timeout: float) -> tuple[int, str, str]:
+    workdir = Path(tempfile.mkdtemp(prefix="jarvis-ps-"))
+    try:
+        ps1 = workdir / "s.ps1"
+        ps1.write_text(script, encoding="utf-8-sig")
+        return await _run("powershell", "-NoProfile", "-NonInteractive",
+                          "-ExecutionPolicy", "Bypass", "-File", str(ps1), *args,
+                          timeout=timeout)
+    finally:
+        shutil.rmtree(workdir, ignore_errors=True)
+
+
+async def _win_capture_screen(display: int | None = None) -> Shot:
+    workdir = Path(tempfile.mkdtemp(prefix="jarvis-screen-"))
+    try:
+        out = workdir / "screen.png"
+        rc, _o, err = await _win_ps(_WIN_CAPTURE_PS, "-Out", str(out),
+                                    "-Display", str(display or 0),
+                                    "-MaxEdge", str(SHOT_MAX_EDGE),
+                                    timeout=CAPTURE_TIMEOUT_SEC + 3)
+        png = out.read_bytes() if out.exists() else b""
+        size = _png_size(png) if png else None
+        if rc != 0 or size is None:
+            log.warning(f"windows capture failed: {err.strip()[:200]}")
+            raise ScreenError("I couldn't get a picture of your screen, sir")
+        if len(png) > MAX_SHOT_BYTES:
+            raise ScreenError("that picture came out far too large to send, sir")
+        return Shot(png=png, width=size[0], height=size[1])
+    finally:
+        shutil.rmtree(workdir, ignore_errors=True)
+
+
+async def _win_list_windows() -> list[Window]:
+    rc, stdout, stderr = await _win_ps(_WIN_WINDOWS_PS, timeout=WINDOWS_TIMEOUT_SEC + 5)
+    if rc != 0:
+        log.warning(f"windows list failed: {stderr.strip()[:200]}")
+        raise ScreenError("I couldn't read what's open, sir")
+    windows: list[Window] = []
+    for line in stdout.splitlines():
+        parts = line.split("|||")
+        if len(parts) < 3:
+            continue
+        windows.append(Window(app=parts[0].strip(), title=parts[1].strip(),
+                              frontmost=parts[2].strip().lower() == "true"))
+    windows.sort(key=lambda w: not w.frontmost)
+    return windows[:MAX_WINDOWS]
+
+
+if sys.platform == "win32":
+    capture_screen = _win_capture_screen      # noqa: F811
+    list_windows = _win_list_windows          # noqa: F811
