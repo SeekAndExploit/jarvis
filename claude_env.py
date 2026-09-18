@@ -56,3 +56,18 @@ def child_env(base: dict[str, str] | None = None) -> dict[str, str]:
     return {k: v for k, v in source.items()
             if not k.startswith(SCRUBBED_ENV_PREFIXES)
             and k not in SCRUBBED_ENV_KEYS}
+
+
+def split_command(cmd: str) -> list[str]:
+    """Split a configured `claude` command into argv.
+
+    Windows patch: POSIX shlex eats backslashes, turning
+    C:\\Users\\me\\.local\\bin\\claude.exe into C:Usersme.localbinclaude.exe.
+    An existing path is used whole; otherwise split in non-POSIX mode.
+    """
+    import shlex
+    if os.name == "nt":
+        if os.path.exists(cmd):
+            return [cmd]
+        return [p.strip('"') for p in shlex.split(cmd, posix=False)]
+    return shlex.split(cmd)
