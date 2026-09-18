@@ -390,3 +390,115 @@ async def answer(pid: int, key: str) -> str:
     except Exception as e:
         log.warning(f"answering a dialog for pid {pid} failed: {e}", exc_info=True)
         return FAILED
+
+
+# ── Windows patch ──────────────────────────────────────────────────────────
+# No tty, no Terminal.app, no AppleScript. The Windows equivalent of
+# "pid -> tty -> tab" is "pid -> the console it is attached to": a helper
+# process attaches to THAT pid's console (AttachConsole) and writes the key
+# into its input buffer (WriteConsoleInputW). The same three rules hold:
+# found by pid never by focus, closed vocabulary, nothing raises. The helper
+# is a separate, windowless process because attaching means detaching from
+# our own console, and the server's must stay put.
+
+import os as _os
+import sys as _sys
+
+_WIN_HELPER = r'''
+import ctypes, sys
+from ctypes import wintypes
+k32 = ctypes.WinDLL("kernel32", use_last_error=True)
+mode, pid = sys.argv[1], int(sys.argv[2])
+k32.FreeConsole()
+if not k32.AttachConsole(wintypes.DWORD(pid)):
+    sys.exit(3)
+k32.GetConsoleWindow.restype = wintypes.HWND
+if mode == "id":
+    # Unique per console, shared by every process attached to it.
+    h = k32.GetConsoleWindow() or 0
+    print("con:%x" % (h or 0))
+    sys.exit(0 if h else 3)
+key = sys.argv[3]
+VK = {"return": (0x0D, "\r"), "escape": (0x1B, "\x1b")}
+if key in VK:
+    vk, ch = VK[key]
+elif len(key) == 1 and key in "123456789":
+    vk, ch = 0x30 + int(key), key
+else:
+    sys.exit(4)
+class KEY_EVENT_RECORD(ctypes.Structure):
+    _fields_ = [("bKeyDown", wintypes.BOOL), ("wRepeatCount", wintypes.WORD),
+                ("wVirtualKeyCode", wintypes.WORD), ("wVirtualScanCode", wintypes.WORD),
+                ("UnicodeChar", wintypes.WCHAR), ("dwControlKeyState", wintypes.DWORD)]
+class _U(ctypes.Union):
+    _fields_ = [("KeyEvent", KEY_EVENT_RECORD), ("_pad", ctypes.c_byte * 16)]
+class INPUT_RECORD(ctypes.Structure):
+    _fields_ = [("EventType", wintypes.WORD), ("Event", _U)]
+k32.CreateFileW.restype = wintypes.HANDLE
+h = k32.CreateFileW("CONIN$", 0xC0000000, 3, None, 3, 0, None)
+if not h or h == wintypes.HANDLE(-1).value:
+    sys.exit(5)
+recs = (INPUT_RECORD * 2)()
+for i, down in enumerate((True, False)):
+    recs[i].EventType = 1
+    ke = recs[i].Event.KeyEvent
+    ke.bKeyDown, ke.wRepeatCount, ke.wVirtualKeyCode = down, 1, vk
+    ke.wVirtualScanCode = ctypes.WinDLL("user32").MapVirtualKeyW(vk, 0)
+    ke.UnicodeChar = ch
+written = wintypes.DWORD()
+ok = k32.WriteConsoleInputW(h, recs, 2, ctypes.byref(written))
+sys.exit(0 if ok and written.value == 2 else 6)
+'''
+
+
+def _win_helper(*args: str, timeout: float) -> tuple[int, str]:
+    import subprocess
+    try:
+        out = subprocess.run(
+            [_sys.executable, "-c", _WIN_HELPER, *args],
+            capture_output=True, text=True, timeout=timeout,
+            creationflags=subprocess.DETACHED_PROCESS
+            | subprocess.CREATE_NO_WINDOW)
+        return out.returncode, out.stdout.strip()
+    except Exception as e:
+        log.warning(f"console helper failed: {e}")
+        return -1, ""
+
+
+def _win_tty_for_pid(pid) -> str | None:
+    try:
+        pid = int(pid)
+    except (TypeError, ValueError):
+        return None
+    if pid <= 0:
+        return None
+    rc, out = _win_helper("id", str(pid), timeout=5.0)
+    if rc != 0 or not re.fullmatch(r"con:[0-9a-f]+", out) or out == "con:0":
+        return None
+    return out
+
+
+async def _win_answer(pid: int, key: str) -> str:
+    normalized = normalize_key(key)
+    if normalized is None:
+        log.warning(f"refusing a key outside the vocabulary: {key!r}")
+        return BAD_KEY
+    try:
+        if await asyncio.to_thread(_win_tty_for_pid, pid) is None:
+            return NO_TTY
+        rc, _ = await asyncio.to_thread(
+            _win_helper, "press", str(int(pid)), normalized, timeout=SEND_TIMEOUT)
+        if rc == 0:
+            return SENT
+        if rc == 3:
+            return NO_TTY
+        log.warning(f"console key press for pid {pid} failed (rc={rc})")
+        return FAILED
+    except Exception as e:
+        log.warning(f"answering a dialog for pid {pid} failed: {e}", exc_info=True)
+        return FAILED
+
+
+if _sys.platform == "win32":
+    tty_for_pid = _win_tty_for_pid      # noqa: F811
+    answer = _win_answer                # noqa: F811

@@ -31,7 +31,10 @@ def post_to_session(socket_path: str | None, prompt: str,
     """
     if not prompt or not prompt.strip():
         return REFUSED
-    if not socket_path or not Path(socket_path).exists():
+    if not socket_path:
+        return NOT_LIVE
+    is_pipe = os.name == "nt" and socket_path.startswith("\\\\.\\pipe\\")
+    if not is_pipe and not Path(socket_path).exists():
         return NOT_LIVE
 
     lines = []
@@ -52,6 +55,20 @@ def post_to_session(socket_path: str | None, prompt: str,
     lines.append(json.dumps({"type": "user",
                              "message": {"role": "user", "content": prompt.strip()}}))
     payload = ("\n".join(lines) + "\n").encode()
+
+    # Windows patch: an inbox there is a named pipe (\\.\pipe\...), or
+    # an AF_UNIX socket only where this Python has AF_UNIX at all.
+    if is_pipe:
+        try:
+            with open(socket_path, "wb", buffering=0) as pipe:
+                pipe.write(payload)
+            return SENT
+        except FileNotFoundError:
+            return NOT_LIVE
+        except OSError:
+            return FAILED
+    if not hasattr(socket, "AF_UNIX"):
+        return FAILED
 
     sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
     sock.settimeout(timeout)

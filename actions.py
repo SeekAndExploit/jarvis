@@ -273,3 +273,132 @@ def _generate_project_name(prompt: str) -> str:
             "web", "page", "site", "named"}
     meaningful = [w for w in words if w not in skip and len(w) > 2][:4]
     return "-".join(meaningful) if meaningful else "jarvis-project"
+
+
+# ── Windows patch ──────────────────────────────────────────────────────────
+# AppleScript does not exist on Windows. Same three actions, done with plain
+# process launches: every value is its own argv entry, never a shell string.
+
+import sys as _sys
+
+_IS_WINDOWS = _sys.platform == "win32"
+
+
+def _win_find_exe(candidates: list[str], which: str | None = None) -> str | None:
+    if which:
+        found = shutil.which(which)
+        if found and found.lower().endswith(".exe"):
+            return found
+    for c in candidates:
+        p = os.path.expandvars(c)
+        if os.path.isfile(p):
+            return p
+    return None
+
+
+def _win_chrome() -> str | None:
+    return _win_find_exe([
+        r"%ProgramFiles%\Google\Chrome\Application\chrome.exe",
+        r"%ProgramFiles(x86)%\Google\Chrome\Application\chrome.exe",
+        r"%LocalAppData%\Google\Chrome\Application\chrome.exe",
+    ], "chrome")
+
+
+def _win_firefox() -> str | None:
+    return _win_find_exe([
+        r"%ProgramFiles%\Mozilla Firefox\firefox.exe",
+        r"%ProgramFiles(x86)%\Mozilla Firefox\firefox.exe",
+    ], "firefox")
+
+
+def _win_vscode() -> str | None:
+    # Code.exe itself, never code.cmd: a .cmd runs through cmd.exe, which
+    # re-parses its arguments, and a path is not something to hand cmd.exe.
+    return _win_find_exe([
+        r"%LocalAppData%\Programs\Microsoft VS Code\Code.exe",
+        r"%ProgramFiles%\Microsoft VS Code\Code.exe",
+    ])
+
+
+async def _win_launch(argv: list[str], new_console: bool = False) -> tuple[bool, str]:
+    import subprocess
+    flags = subprocess.CREATE_NEW_CONSOLE if new_console else 0
+    try:
+        await asyncio.to_thread(
+            subprocess.Popen, argv, creationflags=flags,
+            stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL, close_fds=True)
+        return True, ""
+    except OSError as e:
+        return False, str(e)
+
+
+async def _win_open_terminal(command: str = "") -> dict:
+    argv = ["powershell.exe", "-NoExit"]
+    if command:
+        # Windows PowerShell 5 has no `&&`: run each step only if the last
+        # one succeeded, which is what `&&` meant.
+        steps = [c.strip() for c in command.split(" && ") if c.strip()]
+        script = steps[-1]
+        for step in reversed(steps[:-1]):
+            script = f"{step}; if ($?) {{ {script} }}"
+        argv += ["-Command", script]
+    ok, err = await _win_launch(argv, new_console=True)
+    if not ok:
+        log.error(f"open_terminal failed: {err}")
+    return {"success": ok,
+            "confirmation": "Terminal is open, sir." if ok
+            else "I had trouble opening a terminal, sir."}
+
+
+async def _win_open_browser(url: str, browser: str = "chrome") -> dict:
+    if not re.match(r"(?i)^(https?|file):", str(url or "")):
+        return {"success": False,
+                "confirmation": "I'll only open web addresses, sir."}
+    if browser.lower() == "firefox":
+        app_name, exe = "Firefox", _win_firefox()
+    else:
+        app_name, exe = "Chrome", _win_chrome()
+    if exe:
+        ok, err = await _win_launch([exe, url])
+    else:
+        try:
+            os.startfile(url)          # the default browser
+            ok, err = True, ""
+        except OSError as e:
+            ok, err = False, str(e)
+    if not ok:
+        log.error(f"open_browser ({app_name}) failed: {err}")
+    return {"success": ok,
+            "confirmation": f"Pulled that up in {app_name}, sir." if ok
+            else f"{app_name} ran into a problem, sir."}
+
+
+async def _win_open_in_editor(path: str) -> dict:
+    exe = _win_vscode()
+    editor = "VS Code" if exe else "your editor"
+    if exe:
+        ok, err = await _win_launch([exe, str(path)])
+    else:
+        try:
+            os.startfile(str(path))
+            ok, err = True, ""
+        except OSError as e:
+            ok, err = False, str(e)
+    if not ok:
+        log.error(f"open_in_editor failed: {err}")
+    return {"success": ok, "editor": editor,
+            "confirmation": f"Opened that in {editor}, sir." if ok
+            else f"{editor} wouldn't open that, sir."}
+
+
+if _IS_WINDOWS:
+    open_terminal = _win_open_terminal          # noqa: F811
+    open_browser = _win_open_browser            # noqa: F811
+    open_in_editor = _win_open_in_editor        # noqa: F811
+
+    async def open_chrome(url: str) -> dict:    # noqa: F811
+        return await _win_open_browser(url, "chrome")
+
+    async def get_chrome_tab_info() -> dict:    # noqa: F811
+        return {}

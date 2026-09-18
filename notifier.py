@@ -128,3 +128,73 @@ async def notify(title: str, message: str, *, subtitle: str = "") -> bool:
         # Belt and suspenders: this path must never raise into the caller.
         log.warning(f"notifier: unexpected error posting notification: {e}")
         return False
+
+
+# ── Windows patch ──────────────────────────────────────────────────────────
+# A Windows toast via PowerShell + WinRT (built into Windows 10/11). Same rule
+# as the macOS path: the script is fixed, and the untrusted title/message
+# reach it only as environment variables -- data, never PowerShell source.
+
+import os as _os
+
+_WIN_TOAST_PS = r"""
+$ErrorActionPreference = 'Stop'
+[void][Windows.UI.Notifications.ToastNotificationManager, Windows.UI.Notifications, ContentType = WindowsRuntime]
+[void][Windows.Data.Xml.Dom.XmlDocument, Windows.Data.Xml.Dom.XmlDocument, ContentType = WindowsRuntime]
+$title = $env:JARVIS_TOAST_TITLE
+$body = $env:JARVIS_TOAST_MESSAGE
+if ($env:JARVIS_TOAST_SUBTITLE) { $body = $env:JARVIS_TOAST_SUBTITLE + "`n" + $body }
+$tpl = [Windows.UI.Notifications.ToastNotificationManager]::GetTemplateContent([Windows.UI.Notifications.ToastTemplateType]::ToastText02)
+$t = $tpl.GetElementsByTagName('text')
+[void]$t.Item(0).AppendChild($tpl.CreateTextNode($title))
+[void]$t.Item(1).AppendChild($tpl.CreateTextNode($body))
+$toast = [Windows.UI.Notifications.ToastNotification]::new($tpl)
+$app = '{1AC14E77-02E7-4E5D-B744-2EB1AE5198B7}\WindowsPowerShell\v1.0\powershell.exe'
+[Windows.UI.Notifications.ToastNotificationManager]::CreateToastNotifier($app).Show($toast)
+"""
+
+
+def _win_available() -> bool:
+    return shutil.which("powershell") is not None
+
+
+async def _win_notify(title: str, message: str, *, subtitle: str = "") -> bool:
+    try:
+        if not _win_available():
+            return False
+        env = dict(_os.environ)
+        env["JARVIS_TOAST_TITLE"] = _truncate(str(title or ""), _TITLE_MAX)
+        env["JARVIS_TOAST_MESSAGE"] = _truncate(str(message or ""), _MESSAGE_MAX)
+        env["JARVIS_TOAST_SUBTITLE"] = _truncate(str(subtitle or ""), _SUBTITLE_MAX)
+        try:
+            proc = await asyncio.create_subprocess_exec(
+                "powershell", "-NoProfile", "-NonInteractive", "-Command", "-",
+                stdin=asyncio.subprocess.PIPE, stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.PIPE, env=env)
+        except OSError as e:
+            log.warning(f"notifier: failed to spawn powershell: {e}")
+            return False
+        try:
+            _, stderr = await asyncio.wait_for(
+                proc.communicate(_WIN_TOAST_PS.encode("utf-8")),
+                timeout=_TIMEOUT_SECONDS + 5)
+        except asyncio.TimeoutError:
+            try:
+                proc.kill()
+                await proc.communicate()
+            except Exception:
+                pass
+            return False
+        if proc.returncode != 0:
+            log.warning(f"notifier: toast failed: "
+                        f"{stderr.decode(errors='replace').strip()[:200]}")
+            return False
+        return True
+    except Exception as e:
+        log.warning(f"notifier: unexpected error posting notification: {e}")
+        return False
+
+
+if sys.platform == "win32":
+    available = _win_available      # noqa: F811
+    notify = _win_notify            # noqa: F811
